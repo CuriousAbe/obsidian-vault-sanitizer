@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1
+
+- Added restore workflow to recover `[REDACTED:TYPE:RID]` placeholders back to original text using sanitizer map entries.
+- Added restore command and settings action, including passphrase prompt for encrypted map files.
+- Removed settings-page dry-run entry.
+- Updated Chinese command localization so command labels are no longer mixed-language.
+
 ## 1.1.0
 
 - Improved safety of update flow: passphrase is collected before file writes so canceling no longer leaves partially sanitized content.

@@ -31,6 +31,7 @@ function resolveLocale(app) {
 const I18N = {
   en: {
     commandIncremental: "Incremental update",
+    commandRestore: "Restore from sanitizer map",
     modalTitle: "Vault Sanitizer",
     modalStarting: "Starting...",
     stagePreparing: "Preparing",
@@ -38,6 +39,8 @@ const I18N = {
     stageDiffingIncremental: "Diffing incremental files",
     stageSanitizing: "Sanitizing files",
     stageUpdatingMap: "Updating encrypted map",
+    stageLoadingMap: "Loading sanitizer map",
+    stageRestoring: "Restoring files",
     stageUpdatingState: "Updating state",
     stageWritingSummary: "Writing summary",
     passphraseTitle: "Enter sanitizer map passphrase",
@@ -47,22 +50,27 @@ const I18N = {
     passphraseOk: "OK",
     passphraseCancel: "Cancel",
     noticeDone: "Vault Sanitizer done: mode={mode}, processed={processed}, map_added={mapAdded}",
+    noticeRestoreDone: "Vault restore done: files={files}, tokens={tokens}",
     noticeFailed: "Vault Sanitizer failed: {reason}",
     noticeMapPassphraseRetry: "Passphrase does not match existing map. Please re-enter.",
     noticeMapPassphraseMismatch: "Passphrases do not match. Please try again.",
     settingOutputName: "Output directory",
     settingOutputDesc: "All outputs are written under {dir}/",
-    settingDryRunName: "Run dry run",
-    settingDryRunDesc: "Run incremental dry-run from settings page.",
     settingRunButton: "Run",
     settingFullName: "Run full rebuild",
     settingFullDesc: "Force full anonymization run.",
     settingFullButton: "Run Full Rebuild",
     settingFullConfirm: "Run full rebuild now? This may take a while.",
+    settingRestoreName: "Restore from map",
+    settingRestoreDesc: "Recover redacted content from sanitizer map.",
+    settingRestoreButton: "Run Restore",
+    settingRestoreConfirm: "Run restore now? This will overwrite redacted placeholders.",
     errorPassphraseRequired: "Passphrase is required",
+    errorMapNotFound: "Sanitizer map not found",
   },
   zh: {
-    commandIncremental: "Incremental update",
+    commandIncremental: "增量更新",
+    commandRestore: "从映射表恢复原文",
     modalTitle: "Vault Sanitizer",
     modalStarting: "开始执行...",
     stagePreparing: "准备中",
@@ -70,6 +78,8 @@ const I18N = {
     stageDiffingIncremental: "比对增量文件",
     stageSanitizing: "匿名化处理中",
     stageUpdatingMap: "更新加密映射表",
+    stageLoadingMap: "加载映射表",
+    stageRestoring: "恢复文件内容",
     stageUpdatingState: "更新状态文件",
     stageWritingSummary: "写入汇总",
     passphraseTitle: "输入映射表密码",
@@ -79,19 +89,23 @@ const I18N = {
     passphraseOk: "确认",
     passphraseCancel: "取消",
     noticeDone: "Vault Sanitizer 完成：模式={mode}，处理={processed}，新增映射={mapAdded}",
+    noticeRestoreDone: "原文恢复完成：文件={files}，替换={tokens}",
     noticeFailed: "Vault Sanitizer 失败：{reason}",
     noticeMapPassphraseRetry: "密码与已有映射表不一致，请重新输入。",
     noticeMapPassphraseMismatch: "两次输入的密码不一致，请重试。",
     settingOutputName: "输出目录",
     settingOutputDesc: "所有输出写入 {dir}/",
-    settingDryRunName: "运行 dry run",
-    settingDryRunDesc: "在设置页触发增量 dry-run。",
     settingRunButton: "运行",
     settingFullName: "运行全量重建",
     settingFullDesc: "强制执行全量匿名化。",
     settingFullButton: "全量重建",
     settingFullConfirm: "现在执行全量重建？这可能需要较长时间。",
+    settingRestoreName: "从映射表恢复",
+    settingRestoreDesc: "基于映射表还原已脱敏内容。",
+    settingRestoreButton: "执行恢复",
+    settingRestoreConfirm: "现在执行恢复？这会覆盖脱敏占位符。",
     errorPassphraseRequired: "必须输入密码",
+    errorMapNotFound: "未找到映射表",
   },
 }
 
@@ -250,6 +264,30 @@ function appendMapRows(existingMapText, rows) {
   if (lines.length === 0) return { text: existingMapText, added: 0 }
   const sep = existingMapText.endsWith("\n") ? "" : "\n"
   return { text: `${existingMapText}${sep}${lines.join("\n")}\n`, added: lines.length }
+}
+
+function unescapeMdCell(v) {
+  return String(v ?? "").replace(/\\\|/g, "|")
+}
+
+function parseMapRidLookup(mapText) {
+  const ridToOriginal = new Map()
+  const re = /^\|\s*(R[0-9a-fA-F]{12})\s*\|\s*((?:\\\||[^|])*)\s*\|\s*$/gm
+  let m
+  while ((m = re.exec(mapText)) !== null) {
+    ridToOriginal.set(m[1], unescapeMdCell(m[2]))
+  }
+  return ridToOriginal
+}
+
+function restoreContent(text, ridToOriginal) {
+  let replaced = 0
+  const out = text.replace(/\[REDACTED:[A-Z_]+:(R[0-9a-fA-F]{12})\]/g, (match, rid) => {
+    if (!ridToOriginal.has(rid)) return match
+    replaced += 1
+    return ridToOriginal.get(rid)
+  })
+  return { text: out, replaced }
 }
 
 async function ensureFolder(adapter, folder) {
@@ -498,6 +536,12 @@ class VaultSanitizerPlugin extends Plugin {
       callback: async () => this.runProcess({ mode: "incremental", dryRun: false }),
     })
 
+    this.addCommand({
+      id: "vault-sanitizer-restore",
+      name: this.t("commandRestore"),
+      callback: async () => this.runRestoreProcess(),
+    })
+
     this.addSettingTab(new VaultSanitizerSettingTab(this.app, this))
   }
 
@@ -585,6 +629,63 @@ class VaultSanitizerPlugin extends Plugin {
     }
 
     return { passphrase, existingMapText, hasEncryptedMap, hasLegacyMap }
+  }
+
+  async loadMapTextForRestore(adapter) {
+    if (await adapter.exists(MAP_ENC_PATH)) {
+      const bin = new Uint8Array(await adapter.readBinary(MAP_ENC_PATH))
+      while (true) {
+        const modal = new PassphraseModal(this.app, this.t.bind(this), { titleKey: "passphraseExistingTitle" })
+        const passphrase = await modal.wait()
+        if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
+        try {
+          return await decryptBytesV2(this.webCrypto, passphrase, bin)
+        } catch (_err) {
+          new Notice(this.t("noticeMapPassphraseRetry"))
+        }
+      }
+    }
+
+    if (await adapter.exists(LEGACY_MAP_PATH)) {
+      return adapter.read(LEGACY_MAP_PATH)
+    }
+
+    throw new Error(this.t("errorMapNotFound"))
+  }
+
+  async runRestoreProcess() {
+    const progress = new ProgressModal(this.app, this.t.bind(this))
+    progress.open()
+
+    try {
+      const adapter = this.app.vault.adapter
+      const all = this.app.vault.getMarkdownFiles().filter((f) => !shouldSkip(f.path, this.settings.skipPrefixes || []))
+
+      progress.setProgress(this.t("stageLoadingMap"), 0, 1)
+      const mapText = await this.loadMapTextForRestore(adapter)
+      const ridToOriginal = parseMapRidLookup(mapText)
+
+      let restoredFiles = 0
+      let restoredTokens = 0
+      for (let i = 0; i < all.length; i++) {
+        const f = all[i]
+        progress.setProgress(this.t("stageRestoring"), i + 1, all.length, f.path)
+        const text = await this.app.vault.read(f)
+        const restored = restoreContent(text, ridToOriginal)
+        if (restored.replaced > 0) {
+          restoredFiles += 1
+          restoredTokens += restored.replaced
+          await this.app.vault.modify(f, restored.text)
+        }
+      }
+
+      new Notice(this.t("noticeRestoreDone", { files: restoredFiles, tokens: restoredTokens }))
+    } catch (error) {
+      new Notice(this.t("noticeFailed", { reason: error instanceof Error ? error.message : String(error) }))
+      throw error
+    } finally {
+      progress.close()
+    }
   }
 
   async runProcess({ mode, dryRun }) {
@@ -740,15 +841,6 @@ class VaultSanitizerSettingTab extends PluginSettingTab {
       .setDesc(this.plugin.t("settingOutputDesc", { dir: APP_DIR }))
 
     new Setting(containerEl)
-      .setName(this.plugin.t("settingDryRunName"))
-      .setDesc(this.plugin.t("settingDryRunDesc"))
-      .addButton((b) =>
-        b.setButtonText(this.plugin.t("settingRunButton")).onClick(async () => {
-          await this.plugin.runProcess({ mode: "incremental", dryRun: true })
-        })
-      )
-
-    new Setting(containerEl)
       .setName(this.plugin.t("settingFullName"))
       .setDesc(this.plugin.t("settingFullDesc"))
       .addButton((b) =>
@@ -756,6 +848,17 @@ class VaultSanitizerSettingTab extends PluginSettingTab {
           const ok = window.confirm(this.plugin.t("settingFullConfirm"))
           if (!ok) return
           await this.plugin.runProcess({ mode: "full", dryRun: false })
+        })
+      )
+
+    new Setting(containerEl)
+      .setName(this.plugin.t("settingRestoreName"))
+      .setDesc(this.plugin.t("settingRestoreDesc"))
+      .addButton((b) =>
+        b.setWarning().setButtonText(this.plugin.t("settingRestoreButton")).onClick(async () => {
+          const ok = window.confirm(this.plugin.t("settingRestoreConfirm"))
+          if (!ok) return
+          await this.plugin.runRestoreProcess()
         })
       )
   }

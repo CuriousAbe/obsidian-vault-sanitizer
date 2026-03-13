@@ -11,8 +11,8 @@ Incremental anonymization plugin for Obsidian vaults.
 - Command palette:
   - `Obsidian Vault Sanitizer: Incremental Update`
 - Settings page actions:
-  - Run dry-run (incremental)
   - Run full rebuild
+  - Restore from map
 - Progress modal while running (blocking UI)
 - Redaction format with unique IDs:
   - `[REDACTED:TYPE:Rxxxxxxxxxxxx]`
@@ -37,8 +37,8 @@ Obsidian 的增量匿名化插件。
 - 命令面板：
   - `Obsidian Vault Sanitizer: Incremental Update`
 - 设置页操作：
-  - 运行增量 dry-run
   - 运行 full rebuild
+  - 从映射表恢复原文
 - 运行中显示阻塞式进度弹窗
 - 脱敏格式带唯一 ID：
   - `[REDACTED:TYPE:Rxxxxxxxxxxxx]`
