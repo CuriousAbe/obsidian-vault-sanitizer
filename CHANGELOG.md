@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.3
+
+- Rename plugin id from `obsidian-vault-sanitizer` to `vault-sanitizer` to satisfy Community Plugins naming rules.
+- Keep functionality unchanged; this release is metadata-only for marketplace submission.
+
 ## 1.1.2
 
 - Finalized command palette naming to avoid mixed-language display by using consistent English command labels.
