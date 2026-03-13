@@ -43,6 +43,15 @@ const I18N = {
     stageRestoring: "Restoring files",
     stageUpdatingState: "Updating state",
     stageWritingSummary: "Writing summary",
+    reviewTitle: "Review redaction",
+    reviewPrompt: "Redact this match and add it to the sanitizer map?",
+    reviewRedact: "Redact",
+    reviewSkip: "Skip",
+    reviewRedactAll: "Redact all",
+    reviewSkipAll: "Skip all",
+    reviewFile: "File",
+    reviewKind: "Type",
+    reviewCount: "Match {current}/{total}",
     passphraseTitle: "Enter sanitizer map passphrase",
     passphraseNewTitle: "Set sanitizer map passphrase",
     passphraseConfirmTitle: "Confirm sanitizer map passphrase",
@@ -82,6 +91,15 @@ const I18N = {
     stageRestoring: "恢复文件内容",
     stageUpdatingState: "更新状态文件",
     stageWritingSummary: "写入汇总",
+    reviewTitle: "确认脱敏项",
+    reviewPrompt: "是否脱敏该内容并写入映射表？",
+    reviewRedact: "脱敏",
+    reviewSkip: "跳过",
+    reviewRedactAll: "全部脱敏",
+    reviewSkipAll: "全部跳过",
+    reviewFile: "文件",
+    reviewKind: "类型",
+    reviewCount: "第 {current}/{total} 条",
     passphraseTitle: "输入映射表密码",
     passphraseNewTitle: "设置映射表密码",
     passphraseConfirmTitle: "确认映射表密码",
@@ -288,6 +306,130 @@ function restoreContent(text, ridToOriginal) {
     return ridToOriginal.get(rid)
   })
   return { text: out, replaced }
+}
+
+function overlap(aStart, aEnd, bStart, bEnd) {
+  return aStart < bEnd && bStart < aEnd
+}
+
+function linePreviewWithHighlight(text, start, end) {
+  const lineStart = text.lastIndexOf("\n", Math.max(0, start - 1)) + 1
+  const lineEndRaw = text.indexOf("\n", end)
+  const lineEnd = lineEndRaw === -1 ? text.length : lineEndRaw
+  const line = text.slice(lineStart, lineEnd)
+  const relStart = Math.max(0, start - lineStart)
+  const relEnd = Math.max(relStart, end - lineStart)
+
+  const MAX_LEN = 180
+  if (line.length <= MAX_LEN) {
+    return {
+      before: line.slice(0, relStart),
+      target: line.slice(relStart, relEnd),
+      after: line.slice(relEnd),
+    }
+  }
+
+  const half = Math.floor((MAX_LEN - (relEnd - relStart)) / 2)
+  const snippetStart = Math.max(0, relStart - half)
+  const snippetEnd = Math.min(line.length, relEnd + half)
+  const prefix = snippetStart > 0 ? "..." : ""
+  const suffix = snippetEnd < line.length ? "..." : ""
+  const snippet = line.slice(snippetStart, snippetEnd)
+  const targetStartInSnippet = relStart - snippetStart
+  const targetEndInSnippet = relEnd - snippetStart
+
+  return {
+    before: `${prefix}${snippet.slice(0, targetStartInSnippet)}`,
+    target: snippet.slice(targetStartInSnippet, targetEndInSnippet),
+    after: `${snippet.slice(targetEndInSnippet)}${suffix}`,
+  }
+}
+
+function collectRedactionCandidates(text, ctx) {
+  const raw = []
+  const push = (item) => {
+    if (!item || item.start >= item.end) return
+    raw.push(item)
+  }
+
+  const labeledPatterns = [
+    { re: new RegExp(SENSITIVE_LABEL_VALUE_WITH_SEPARATOR.source, SENSITIVE_LABEL_VALUE_WITH_SEPARATOR.flags), kind: "LABEL" },
+    { re: new RegExp(SENSITIVE_LABEL_VALUE_NO_SEPARATOR.source, SENSITIVE_LABEL_VALUE_NO_SEPARATOR.flags), kind: "PASSWORD" },
+  ]
+
+  for (const { re, kind } of labeledPatterns) {
+    let m
+    while ((m = re.exec(text)) !== null) {
+      const prefix = String(m[1] ?? "")
+      const label = String(m[2] ?? "")
+      const sep = String(m[3] ?? "")
+      const value = String(m[4] ?? "")
+      if (!value || value.startsWith("[REDACTED:")) continue
+      const valueStart = m.index + prefix.length + label.length + sep.length
+      push({
+        kind,
+        original: value,
+        start: valueStart,
+        end: valueStart + value.length,
+      })
+    }
+  }
+
+  for (const key of ["EMAIL", "PHONE_CN", "PHONE_US", "CN_ID", "BANK_CARD"]) {
+    const re = new RegExp(RISK_PATTERNS[key].source, RISK_PATTERNS[key].flags)
+    let m
+    while ((m = re.exec(text)) !== null) {
+      const value = String(m[0] ?? "")
+      const start = m.index
+      if (!value || value.startsWith("[REDACTED:")) continue
+      if (shouldSkipNumericMatch(text, start, value, key)) continue
+      push({
+        kind: key,
+        original: value,
+        start,
+        end: start + value.length,
+      })
+    }
+  }
+
+  raw.sort((a, b) => (a.start - b.start) || (a.end - b.end))
+  const accepted = []
+  for (const item of raw) {
+    if (accepted.some((x) => overlap(x.start, x.end, item.start, item.end))) continue
+    accepted.push(item)
+  }
+
+  let ordinal = 0
+  for (const item of accepted) {
+    ordinal += 1
+    const lc = lineAndColAt(text, item.start)
+    item.rid = makeRid(ctx.runSalt, ctx.path, lc.line, lc.col, item.kind, item.original, ordinal)
+    item.replacement = `[REDACTED:${item.kind}:${item.rid}]`
+    item.preview = linePreviewWithHighlight(text, item.start, item.end)
+  }
+
+  return accepted
+}
+
+function applyRedactionDecisions(text, candidates) {
+  if (!candidates || candidates.length === 0) return { text, mapRows: [] }
+  const selected = candidates.filter((c) => c && c.selected)
+  if (selected.length === 0) return { text, mapRows: [] }
+
+  selected.sort((a, b) => a.start - b.start)
+  let cursor = 0
+  let out = ""
+  const mapRows = []
+
+  for (const c of selected) {
+    out += text.slice(cursor, c.start)
+    out += c.replacement
+    cursor = c.end
+    mapRows.push({ rid: c.rid, original: c.original })
+  }
+  out += text.slice(cursor)
+
+  return { text: out, mapRows }
 }
 
 async function ensureFolder(adapter, folder) {
@@ -524,6 +666,62 @@ class PassphraseModal extends Modal {
   }
 }
 
+class RedactionReviewModal extends Modal {
+  constructor(app, t, payload) {
+    super(app)
+    this.t = t
+    this.payload = payload
+    this.resolver = null
+  }
+
+  onOpen() {
+    const { contentEl } = this
+    contentEl.empty()
+    contentEl.createEl("h3", { text: this.t("reviewTitle") })
+    contentEl.createEl("p", { text: this.t("reviewPrompt") })
+    contentEl.createEl("p", { text: this.t("reviewCount", { current: this.payload.current, total: this.payload.total }) })
+    contentEl.createEl("p", { text: `${this.t("reviewFile")}: ${this.payload.path}` })
+    contentEl.createEl("p", { text: `${this.t("reviewKind")}: ${this.payload.kind}` })
+
+    const line = contentEl.createDiv({ cls: "vault-sanitizer-review-line" })
+    line.appendText(this.payload.preview.before || "")
+    line.createEl("mark", { cls: "vault-sanitizer-review-mark", text: this.payload.preview.target || "" })
+    line.appendText(this.payload.preview.after || "")
+
+    const row = contentEl.createDiv({ cls: "vault-sanitizer-review-actions" })
+    const btnRedact = row.createEl("button", { text: this.t("reviewRedact") })
+    const btnSkip = row.createEl("button", { text: this.t("reviewSkip") })
+    const btnRedactAll = row.createEl("button", { text: this.t("reviewRedactAll") })
+    const btnSkipAll = row.createEl("button", { text: this.t("reviewSkipAll") })
+
+    const done = (val) => {
+      if (this.resolver) this.resolver(val)
+      this.close()
+    }
+
+    btnRedact.onclick = () => done("redact")
+    btnSkip.onclick = () => done("skip")
+    btnRedactAll.onclick = () => done("redact-all")
+    btnSkipAll.onclick = () => done("skip-all")
+
+    this.scope.register([], "Enter", () => {
+      done("redact")
+      return false
+    })
+    this.scope.register([], "Escape", () => {
+      done("skip")
+      return false
+    })
+  }
+
+  wait() {
+    return new Promise((resolve) => {
+      this.resolver = resolve
+      this.open()
+    })
+  }
+}
+
 class VaultSanitizerPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData())
@@ -555,47 +753,45 @@ class VaultSanitizerPlugin extends Plugin {
     return template.replace(/\{(\w+)\}/g, (_m, name) => String(vars[name] ?? ""))
   }
 
-  redactContent(text, ctx) {
-    const mapRows = []
-    let ordinal = 0
-    let out = text
+  async reviewAndRedactContent(text, ctx, reviewState) {
+    const candidates = collectRedactionCandidates(text, ctx)
+    if (candidates.length === 0) return { text, mapRows: [] }
 
-    const redactLabeledPairs = (pattern, kind) =>
-      out.replace(new RegExp(pattern.source, pattern.flags), (...args) => {
-        const match = args[0]
-        const prefix = args[1]
-        const label = args[2]
-        const sep = args[3]
-        const value = args[4]
-        if (String(value).startsWith("[REDACTED:")) return match
-        const offset = args[args.length - 2]
-        const valueOffset = offset + String(prefix).length + String(label).length + String(sep).length
-        ordinal += 1
-        const lc = lineAndColAt(out, valueOffset)
-        const rid = makeRid(ctx.runSalt, ctx.path, lc.line, lc.col, kind, value, ordinal)
-        mapRows.push({ rid, original: value })
-        return `${prefix}${label}${sep}[REDACTED:${kind}:${rid}]`
+    for (let i = 0; i < candidates.length; i += 1) {
+      const candidate = candidates[i]
+
+      if (reviewState.mode === "redact-all") {
+        candidate.selected = true
+        continue
+      }
+      if (reviewState.mode === "skip-all") {
+        candidate.selected = false
+        continue
+      }
+
+      const modal = new RedactionReviewModal(this.app, this.t.bind(this), {
+        current: i + 1,
+        total: candidates.length,
+        path: ctx.path,
+        kind: candidate.kind,
+        preview: candidate.preview,
       })
+      const decision = await modal.wait()
 
-    out = redactLabeledPairs(SENSITIVE_LABEL_VALUE_WITH_SEPARATOR, "LABEL")
-    out = redactLabeledPairs(SENSITIVE_LABEL_VALUE_NO_SEPARATOR, "PASSWORD")
-
-    for (const key of ["EMAIL", "PHONE_CN", "PHONE_US", "CN_ID", "BANK_CARD"]) {
-      const re = new RegExp(RISK_PATTERNS[key].source, RISK_PATTERNS[key].flags)
-      out = out.replace(re, (...args) => {
-        const match = args[0]
-        if (String(match).startsWith("[REDACTED:")) return match
-        const offset = args[args.length - 2]
-        if (shouldSkipNumericMatch(out, offset, match, key)) return match
-        ordinal += 1
-        const lc = lineAndColAt(out, offset)
-        const rid = makeRid(ctx.runSalt, ctx.path, lc.line, lc.col, key, match, ordinal)
-        mapRows.push({ rid, original: match })
-        return `[REDACTED:${key}:${rid}]`
-      })
+      if (decision === "redact-all") {
+        reviewState.mode = "redact-all"
+        candidate.selected = true
+      } else if (decision === "skip-all") {
+        reviewState.mode = "skip-all"
+        candidate.selected = false
+      } else if (decision === "redact") {
+        candidate.selected = true
+      } else {
+        candidate.selected = false
+      }
     }
 
-    return { text: out, mapRows }
+    return applyRedactionDecisions(text, candidates)
   }
 
   async prepareMapContext(adapter) {
@@ -752,12 +948,13 @@ class VaultSanitizerPlugin extends Plugin {
       const processedFiles = all.filter((f) => toProcess.has(f.path))
       const mapRows = []
       let changedFiles = 0
+      const reviewState = { mode: mode === "incremental" ? "ask" : "redact-all" }
 
       for (let i = 0; i < processedFiles.length; i++) {
         const f = processedFiles[i]
         progress.setProgress(this.t("stageSanitizing"), i + 1, processedFiles.length, f.path)
         const text = await this.app.vault.read(f)
-        const red = this.redactContent(text, { runSalt, path: f.path })
+        const red = await this.reviewAndRedactContent(text, { runSalt, path: f.path }, reviewState)
         mapRows.push(...red.mapRows)
         if (red.text !== text) {
           changedFiles += 1

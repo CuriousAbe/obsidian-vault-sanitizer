@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.4
+
+- Add per-match review during incremental update: confirm redact/skip for each hit with highlighted one-line preview.
+- Add bulk actions in review flow: `Redact all` and `Skip all` to avoid repetitive prompts.
+
 ## 1.1.3
 
 - Rename plugin id from `obsidian-vault-sanitizer` to `vault-sanitizer` to satisfy Community Plugins naming rules.

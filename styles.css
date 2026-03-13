@@ -5,3 +5,28 @@
 .vault-sanitizer-progress-fill {
   transition: width 120ms ease;
 }
+
+.vault-sanitizer-review-line {
+  margin: 12px 0;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+  word-break: break-word;
+  font-family: var(--font-monospace);
+  white-space: pre-wrap;
+}
+
+.vault-sanitizer-review-mark {
+  background: var(--text-highlight-bg);
+  color: var(--text-normal);
+  padding: 0 2px;
+  border-radius: 3px;
+}
+
+.vault-sanitizer-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
