@@ -100,23 +100,15 @@ const RISK_PATTERNS = {
   PHONE_CN: /(?<!\d)1[3-9]\d{9}(?!\d)/g,
   CN_ID: /(?<!\d)(\d{17}[\dXx]|\d{15})(?!\d)/g,
   BANK_CARD: /(?<!\d)\d{16,19}(?!\d)/g,
-  LONG_DIGITS: /(?<!\d)\d{10,15}(?!\d)/g,
 }
 
-const SENSITIVE_LABEL_PATTERNS = [
+const LABEL_PATTERNS_WITH_SEPARATOR = [
   "password",
   "passwd",
   "pwd",
-  "登录密码",
-  "登入密码",
-  "交易密码",
-  "邮箱密码",
-  "店铺密码",
-  "密码",
   "token",
   "api[_\\s-]?key",
   "secret",
-  "密钥(?:\\s*v\\d+)?",
   "key",
   "账号",
   "账户",
@@ -125,7 +117,6 @@ const SENSITIVE_LABEL_PATTERNS = [
   "orgid",
   "account\\s*name",
   "account\\s*number",
-  "account",
   "swift(?:\\s*code)?",
   "local\\s*bank\\s*code",
   "work\\s*phone(?:\\s*\\[\\])?",
@@ -140,10 +131,24 @@ const SENSITIVE_LABEL_PATTERNS = [
   "收款人名字",
   "收款人地址",
   "银行地址",
+  "密钥(?:\\s*[Vv]\\s*\\d+)?",
+  "登录密码",
+  "登入密码",
+  "交易密码",
+  "邮箱密码",
+  "店铺密码",
+  "密码",
 ]
 
-const SENSITIVE_LABEL_VALUE = new RegExp(
-  `(^|[\\s,;，；])(${SENSITIVE_LABEL_PATTERNS.join("|")})(\\s*(?:[:：=]|\\s)\\s*|\\s*)([^\\s,;，；]{4,})`,
+const LABEL_PATTERNS_NO_SEPARATOR = ["登录密码", "登入密码", "交易密码", "邮箱密码", "店铺密码", "密码", "password", "passwd", "pwd"]
+
+const SENSITIVE_LABEL_VALUE_WITH_SEPARATOR = new RegExp(
+  `(^|[\\s,;，；])(${LABEL_PATTERNS_WITH_SEPARATOR.join("|")})(\\s*[:：=]\\s*)([^\\s,;，；]+)`,
+  "gim"
+)
+
+const SENSITIVE_LABEL_VALUE_NO_SEPARATOR = new RegExp(
+  `(^|[\\s,;，；])(${LABEL_PATTERNS_NO_SEPARATOR.join("|")})(\\s*)([A-Za-z0-9][A-Za-z0-9._@#\\/-]{3,})`,
   "gim"
 )
 
@@ -472,24 +477,27 @@ class VaultSanitizerPlugin extends Plugin {
     let ordinal = 0
     let out = text
 
-    const pairRe = new RegExp(SENSITIVE_LABEL_VALUE.source, SENSITIVE_LABEL_VALUE.flags)
-    out = out.replace(pairRe, (...args) => {
-      const match = args[0]
-      const prefix = args[1]
-      const label = args[2]
-      const sep = args[3]
-      const value = args[4]
-      if (String(value).startsWith("[REDACTED:")) return match
-      const offset = args[args.length - 2]
-      const valueOffset = offset + String(prefix).length + String(label).length + String(sep).length
-      ordinal += 1
-      const lc = lineAndColAt(out, valueOffset)
-      const rid = makeRid(ctx.runSalt, ctx.path, lc.line, lc.col, "LABEL", value, ordinal)
-      mapRows.push({ rid, original: value })
-      return `${prefix}${label}${sep}[REDACTED:LABEL:${rid}]`
-    })
+    const redactLabeledPairs = (pattern, kind) =>
+      out.replace(new RegExp(pattern.source, pattern.flags), (...args) => {
+        const match = args[0]
+        const prefix = args[1]
+        const label = args[2]
+        const sep = args[3]
+        const value = args[4]
+        if (String(value).startsWith("[REDACTED:")) return match
+        const offset = args[args.length - 2]
+        const valueOffset = offset + String(prefix).length + String(label).length + String(sep).length
+        ordinal += 1
+        const lc = lineAndColAt(out, valueOffset)
+        const rid = makeRid(ctx.runSalt, ctx.path, lc.line, lc.col, kind, value, ordinal)
+        mapRows.push({ rid, original: value })
+        return `${prefix}${label}${sep}[REDACTED:${kind}:${rid}]`
+      })
 
-    for (const key of ["EMAIL", "PHONE_CN", "CN_ID", "BANK_CARD", "LONG_DIGITS"]) {
+    out = redactLabeledPairs(SENSITIVE_LABEL_VALUE_WITH_SEPARATOR, "LABEL")
+    out = redactLabeledPairs(SENSITIVE_LABEL_VALUE_NO_SEPARATOR, "PASSWORD")
+
+    for (const key of ["EMAIL", "PHONE_CN", "CN_ID", "BANK_CARD"]) {
       const re = new RegExp(RISK_PATTERNS[key].source, RISK_PATTERNS[key].flags)
       out = out.replace(re, (...args) => {
         const match = args[0]
