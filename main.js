@@ -98,6 +98,7 @@ const I18N = {
 const RISK_PATTERNS = {
   EMAIL: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g,
   PHONE_CN: /(?<!\d)1[3-9]\d{9}(?!\d)/g,
+  PHONE_US: /(?<!\d)(?:\(\d{3}\)\s*\d{3}[-\s]\d{4}|\d{3}[-\s]\d{3}[-\s]\d{4})(?!\d)/g,
   CN_ID: /(?<!\d)(\d{17}[\dXx]|\d{15})(?!\d)/g,
   BANK_CARD: /(?<!\d)\d{16,19}(?!\d)/g,
 }
@@ -132,11 +133,18 @@ const LABEL_PATTERNS_WITH_SEPARATOR = [
   "收款人地址",
   "银行地址",
   "密钥(?:\\s*[Vv]\\s*\\d+)?",
+  "用户密码",
+  "user\\s*password",
   "登录密码",
   "登入密码",
   "交易密码",
   "邮箱密码",
   "店铺密码",
+  "您的手机号码",
+  "手机号码",
+  "your\\s*phone\\s*number",
+  "your\\s*username",
+  "shop\\s*code",
   "密码",
 ]
 
@@ -497,7 +505,7 @@ class VaultSanitizerPlugin extends Plugin {
     out = redactLabeledPairs(SENSITIVE_LABEL_VALUE_WITH_SEPARATOR, "LABEL")
     out = redactLabeledPairs(SENSITIVE_LABEL_VALUE_NO_SEPARATOR, "PASSWORD")
 
-    for (const key of ["EMAIL", "PHONE_CN", "CN_ID", "BANK_CARD"]) {
+    for (const key of ["EMAIL", "PHONE_CN", "PHONE_US", "CN_ID", "BANK_CARD"]) {
       const re = new RegExp(RISK_PATTERNS[key].source, RISK_PATTERNS[key].flags)
       out = out.replace(re, (...args) => {
         const match = args[0]
