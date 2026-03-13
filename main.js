@@ -133,6 +133,7 @@ const LABEL_PATTERNS_WITH_SEPARATOR = [
   "收款人地址",
   "银行地址",
   "密钥(?:\\s*[Vv]\\s*\\d+)?",
+  "操作密码",
   "用户密码",
   "user\\s*password",
   "登录密码",
@@ -145,10 +146,23 @@ const LABEL_PATTERNS_WITH_SEPARATOR = [
   "your\\s*phone\\s*number",
   "your\\s*username",
   "shop\\s*code",
+  "香港手机卡",
   "密码",
 ]
 
-const LABEL_PATTERNS_NO_SEPARATOR = ["登录密码", "登入密码", "交易密码", "邮箱密码", "店铺密码", "密码", "password", "passwd", "pwd"]
+const LABEL_PATTERNS_NO_SEPARATOR = [
+  "登录密码",
+  "登入密码",
+  "交易密码",
+  "邮箱密码",
+  "店铺密码",
+  "操作密码",
+  "香港手机卡",
+  "密码",
+  "password",
+  "passwd",
+  "pwd",
+]
 
 const SENSITIVE_LABEL_VALUE_WITH_SEPARATOR = new RegExp(
   `(^|[\\s,;，；])(${LABEL_PATTERNS_WITH_SEPARATOR.join("|")})(\\s*[:：=]\\s*)([^\\s,;，；]+)`,
@@ -156,7 +170,7 @@ const SENSITIVE_LABEL_VALUE_WITH_SEPARATOR = new RegExp(
 )
 
 const SENSITIVE_LABEL_VALUE_NO_SEPARATOR = new RegExp(
-  `(^|[\\s,;，；])(${LABEL_PATTERNS_NO_SEPARATOR.join("|")})(\\s*)([A-Za-z0-9][A-Za-z0-9._@#\\/-]{3,})`,
+  `(^|[\\s,;，；])(${LABEL_PATTERNS_NO_SEPARATOR.join("|")})(\\s+)([A-Za-z0-9+][A-Za-z0-9+._@#\\/-]*(?:\\s+[A-Za-z0-9+._@#\\/-]+){0,2})`,
   "gim"
 )
 
@@ -185,6 +199,23 @@ function lineAndColAt(text, pos) {
     }
   }
   return { line, col: pos - lastBreak }
+}
+
+function tokenAround(text, start, end) {
+  let left = start
+  while (left > 0 && !/\s/.test(text[left - 1])) left -= 1
+  let right = end
+  while (right < text.length && !/\s/.test(text[right])) right += 1
+  return text.slice(left, right)
+}
+
+function shouldSkipNumericMatch(text, start, match, key) {
+  if (key !== "CN_ID" && key !== "BANK_CARD") return false
+  const token = tokenAround(text, start, start + String(match).length).toLowerCase()
+  if (token.includes("http://") || token.includes("https://") || token.includes("www.")) return true
+  if (token.includes("%2f") || token.includes("%3a%2f%2f")) return true
+  if (token.includes("?") || token.includes("&") || token.includes("=")) return true
+  return false
 }
 
 function makeRid(runSalt, filePath, line, col, kind, original, ordinal) {
@@ -511,6 +542,7 @@ class VaultSanitizerPlugin extends Plugin {
         const match = args[0]
         if (String(match).startsWith("[REDACTED:")) return match
         const offset = args[args.length - 2]
+        if (shouldSkipNumericMatch(out, offset, match, key)) return match
         ordinal += 1
         const lc = lineAndColAt(out, offset)
         const rid = makeRid(ctx.runSalt, ctx.path, lc.line, lc.col, key, match, ordinal)
