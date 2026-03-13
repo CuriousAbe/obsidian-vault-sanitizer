@@ -69,8 +69,8 @@ const I18N = {
     errorMapNotFound: "Sanitizer map not found",
   },
   zh: {
-    commandIncremental: "增量更新",
-    commandRestore: "从映射表恢复原文",
+    commandIncremental: "Incremental update",
+    commandRestore: "Restore from sanitizer map",
     modalTitle: "Vault Sanitizer",
     modalStarting: "开始执行...",
     stagePreparing: "准备中",
