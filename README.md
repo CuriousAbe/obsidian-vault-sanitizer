@@ -10,6 +10,7 @@ Incremental anonymization plugin for Obsidian vaults.
 
 - Command palette:
   - `Obsidian Vault Sanitizer: Incremental Update`
+  - `Obsidian Vault Sanitizer: Restore from sanitizer map`
 - Settings page actions:
   - Run full rebuild
   - Restore from map
@@ -36,8 +37,9 @@ Obsidian 的增量匿名化插件。
 
 - 命令面板：
   - `Obsidian Vault Sanitizer: Incremental Update`
+  - `Obsidian Vault Sanitizer: Restore from sanitizer map`
 - 设置页操作：
-  - 运行 full rebuild
+  - 运行全量重建
   - 从映射表恢复原文
 - 运行中显示阻塞式进度弹窗
 - 脱敏格式带唯一 ID：

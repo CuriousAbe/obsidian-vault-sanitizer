@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.2
+
+- Finalized command palette naming to avoid mixed-language display by using consistent English command labels.
+- Added map-based restore command/action that decrypts and parses sanitizer map entries to recover original text from redacted placeholders.
+- Removed the settings-page dry-run action and refreshed docs/version metadata for this release.
+
 ## 1.1.1
 
 - Added restore workflow to recover `[REDACTED:TYPE:RID]` placeholders back to original text using sanitizer map entries.
