@@ -1,0 +1,638 @@
+const { Plugin, Notice, PluginSettingTab, Setting, Modal } = require("obsidian")
+
+const APP_DIR = "obsidian-vault-sanitizer"
+const STATE_PATH = `${APP_DIR}/state.json`
+const MAP_ENC_PATH = `${APP_DIR}/sanitizer-map.md.enc`
+const LEGACY_MAP_PATH = `${APP_DIR}/sanitizer-map.md`
+const SUMMARY_PATH = `${APP_DIR}/sanitizer-summary.md`
+
+const MAGIC_V2_BYTES = new Uint8Array([79, 67, 69, 78, 74, 50])
+const VERSION_V2 = 2
+const FORMAT_ID = "openclaw-vault-encryptor"
+const PBKDF2_ITERATIONS = 210000
+
+const DEFAULT_SETTINGS = {
+  skipPrefixes: [`${APP_DIR}/`, "reports/", "_backup_", "_quarantine_", ".obsidian/plugins/"],
+}
+
+function resolveLocale(app) {
+  try {
+    const configured = app?.vault?.getConfig?.("locale")
+    if (typeof configured === "string" && configured.trim().length > 0) {
+      return configured.toLowerCase().startsWith("zh") ? "zh" : "en"
+    }
+  } catch (_error) {
+    // no-op
+  }
+  const navLang = (globalThis.navigator && globalThis.navigator.language) || "en"
+  return String(navLang).toLowerCase().startsWith("zh") ? "zh" : "en"
+}
+
+const I18N = {
+  en: {
+    commandIncremental: "Incremental update",
+    modalTitle: "Vault Sanitizer",
+    modalStarting: "Starting...",
+    stagePreparing: "Preparing",
+    stageLoadingState: "Loading state",
+    stageDiffingIncremental: "Diffing incremental files",
+    stageSanitizing: "Sanitizing files",
+    stageUpdatingMap: "Updating encrypted map",
+    stageUpdatingState: "Updating state",
+    stageWritingSummary: "Writing summary",
+    passphraseTitle: "Enter sanitizer map passphrase",
+    passphraseExistingTitle: "Existing sanitizer map detected, enter passphrase",
+    passphraseOk: "OK",
+    passphraseCancel: "Cancel",
+    noticeDone: "Vault Sanitizer done: mode={mode}, processed={processed}, map_added={mapAdded}",
+    noticeFailed: "Vault Sanitizer failed: {reason}",
+    noticeMapPassphraseRetry: "Passphrase does not match existing map. Please re-enter.",
+    settingOutputName: "Output directory",
+    settingOutputDesc: "All outputs are written under {dir}/",
+    settingDryRunName: "Run dry run",
+    settingDryRunDesc: "Run incremental dry-run from settings page.",
+    settingRunButton: "Run",
+    settingFullName: "Run full rebuild",
+    settingFullDesc: "Force full anonymization run.",
+    settingFullButton: "Run Full Rebuild",
+    settingFullConfirm: "Run full rebuild now? This may take a while.",
+    errorPassphraseRequired: "Passphrase is required",
+  },
+  zh: {
+    commandIncremental: "Incremental update",
+    modalTitle: "Vault Sanitizer",
+    modalStarting: "开始执行...",
+    stagePreparing: "准备中",
+    stageLoadingState: "加载状态文件",
+    stageDiffingIncremental: "比对增量文件",
+    stageSanitizing: "匿名化处理中",
+    stageUpdatingMap: "更新加密映射表",
+    stageUpdatingState: "更新状态文件",
+    stageWritingSummary: "写入汇总",
+    passphraseTitle: "输入映射表密码",
+    passphraseExistingTitle: "检测到已有映射表，请输入密码",
+    passphraseOk: "确认",
+    passphraseCancel: "取消",
+    noticeDone: "Vault Sanitizer 完成：模式={mode}，处理={processed}，新增映射={mapAdded}",
+    noticeFailed: "Vault Sanitizer 失败：{reason}",
+    noticeMapPassphraseRetry: "密码与已有映射表不一致，请重新输入。",
+    settingOutputName: "输出目录",
+    settingOutputDesc: "所有输出写入 {dir}/",
+    settingDryRunName: "运行 dry run",
+    settingDryRunDesc: "在设置页触发增量 dry-run。",
+    settingRunButton: "运行",
+    settingFullName: "运行全量重建",
+    settingFullDesc: "强制执行全量匿名化。",
+    settingFullButton: "全量重建",
+    settingFullConfirm: "现在执行全量重建？这可能需要较长时间。",
+    errorPassphraseRequired: "必须输入密码",
+  },
+}
+
+const RISK_PATTERNS = {
+  EMAIL: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g,
+  PHONE_CN: /(?<!\d)1[3-9]\d{9}(?!\d)/g,
+  CN_ID: /(?<!\d)(\d{17}[\dXx]|\d{15})(?!\d)/g,
+  BANK_CARD: /(?<!\d)\d{16,19}(?!\d)/g,
+  PASSWORD_LINE: /^(\s*(?:password|passwd|pwd|密码)\s*[:：]\s*)(\S+)\s*$/gim,
+  TOKEN_LINE: /^(\s*(?:token|api[_-]?key|secret)\s*[:：]\s*)(\S+)\s*$/gim,
+}
+
+function nowTs() {
+  const d = new Date()
+  const p = (n) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+}
+
+function shouldSkip(path, prefixes) {
+  return prefixes.some((p) => path.startsWith(p))
+}
+
+function sha256Hex(input) {
+  const crypto = require("crypto")
+  return crypto.createHash("sha256").update(input, "utf8").digest("hex")
+}
+
+function lineAndColAt(text, pos) {
+  let line = 1
+  let lastBreak = -1
+  for (let i = 0; i < pos; i++) {
+    if (text.charCodeAt(i) === 10) {
+      line += 1
+      lastBreak = i
+    }
+  }
+  return { line, col: pos - lastBreak }
+}
+
+function makeRid(runSalt, filePath, line, col, kind, original, ordinal) {
+  const seed = [runSalt, filePath, String(line), String(col), kind, String(ordinal), original].join("|")
+  return `R${sha256Hex(seed).slice(0, 12)}`
+}
+
+function escapeMdCell(v) {
+  return String(v ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ")
+}
+
+function extractExistingRids(mdText) {
+  const out = new Set()
+  const re = /\|\s*(R[0-9a-fA-F]{12})\s*\|/g
+  let m
+  while ((m = re.exec(mdText)) !== null) out.add(m[1])
+  return out
+}
+
+function initMapText() {
+  return "# Sanitizer Map\n\n| RID | Original |\n|---|---|\n"
+}
+
+function appendMapRows(existingMapText, rows) {
+  const existing = extractExistingRids(existingMapText)
+  const lines = []
+  for (const r of rows) {
+    if (!r.rid || existing.has(r.rid)) continue
+    existing.add(r.rid)
+    lines.push(`| ${r.rid} | ${escapeMdCell(r.original)} |`)
+  }
+  if (lines.length === 0) return { text: existingMapText, added: 0 }
+  const sep = existingMapText.endsWith("\n") ? "" : "\n"
+  return { text: `${existingMapText}${sep}${lines.join("\n")}\n`, added: lines.length }
+}
+
+async function ensureFolder(adapter, folder) {
+  if (!folder || folder === ".") return
+  const parts = folder.split("/").filter(Boolean)
+  let cur = ""
+  for (const p of parts) {
+    cur = cur ? `${cur}/${p}` : p
+    if (!(await adapter.exists(cur))) await adapter.mkdir(cur)
+  }
+}
+
+async function getWebCrypto() {
+  if (globalThis.crypto && globalThis.crypto.subtle) return globalThis.crypto
+  try {
+    const nodeCrypto = require("crypto")
+    if (nodeCrypto.webcrypto && nodeCrypto.webcrypto.subtle) return nodeCrypto.webcrypto
+  } catch (_error) {
+    // no-op
+  }
+  throw new Error("Web Crypto API is not available")
+}
+
+function randomBytes(webCrypto, length) {
+  const bytes = new Uint8Array(length)
+  webCrypto.getRandomValues(bytes)
+  return bytes
+}
+
+function writeUint32(target, offset, value) {
+  target[offset] = (value >>> 24) & 0xff
+  target[offset + 1] = (value >>> 16) & 0xff
+  target[offset + 2] = (value >>> 8) & 0xff
+  target[offset + 3] = value & 0xff
+}
+
+function readUint32(source, offset) {
+  return source[offset] * 16777216 + (source[offset + 1] << 16) + (source[offset + 2] << 8) + source[offset + 3]
+}
+
+function startsWithBytes(source, prefix) {
+  if (source.length < prefix.length) return false
+  for (let i = 0; i < prefix.length; i += 1) {
+    if (source[i] !== prefix[i]) return false
+  }
+  return true
+}
+
+function bytesToBase64(bytes) {
+  if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64")
+  let binary = ""
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i])
+  return btoa(binary)
+}
+
+function base64ToBytes(base64) {
+  if (!base64) return new Uint8Array(0)
+  if (typeof Buffer !== "undefined") return new Uint8Array(Buffer.from(base64, "base64"))
+  const binary = atob(base64)
+  const out = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i)
+  return out
+}
+
+function toExactArrayBuffer(bytes) {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+}
+
+async function deriveAesKey(webCrypto, passphrase, salt, iterations) {
+  const keyMaterial = await webCrypto.subtle.importKey("raw", new TextEncoder().encode(passphrase), { name: "PBKDF2" }, false, ["deriveKey"])
+  return webCrypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  )
+}
+
+function packEncryptedPayloadV2(payload) {
+  const header = {
+    format: FORMAT_ID,
+    version: VERSION_V2,
+    cipher: "AES-256-GCM",
+    kdf: "PBKDF2-SHA256",
+    iterations: payload.iterations,
+    salt: bytesToBase64(payload.salt),
+    iv: bytesToBase64(payload.iv),
+    ciphertextLength: payload.encrypted.length,
+    passphraseEncoding: "utf-8",
+  }
+  const headerBytes = new TextEncoder().encode(JSON.stringify(header))
+  const out = new Uint8Array(MAGIC_V2_BYTES.length + 4 + headerBytes.length + payload.encrypted.length)
+  let offset = 0
+  out.set(MAGIC_V2_BYTES, offset)
+  offset += MAGIC_V2_BYTES.length
+  writeUint32(out, offset, headerBytes.length)
+  offset += 4
+  out.set(headerBytes, offset)
+  offset += headerBytes.length
+  out.set(payload.encrypted, offset)
+  return out
+}
+
+function unpackEncryptedPayloadV2(data) {
+  if (!startsWithBytes(data, MAGIC_V2_BYTES)) throw new Error("Invalid encrypted file header")
+  let offset = MAGIC_V2_BYTES.length
+  const headerLen = readUint32(data, offset)
+  offset += 4
+  if (headerLen <= 0 || offset + headerLen > data.length) throw new Error("Encrypted header length is invalid")
+  const headerText = new TextDecoder().decode(data.slice(offset, offset + headerLen))
+  const header = JSON.parse(headerText)
+  offset += headerLen
+  if (header.version !== VERSION_V2 || header.format !== FORMAT_ID) throw new Error("Unsupported encrypted format metadata")
+  const encrypted = data.slice(offset)
+  const expectedLen = Number.parseInt(String(header.ciphertextLength), 10)
+  if (Number.isFinite(expectedLen) && expectedLen > 0 && expectedLen !== encrypted.length) {
+    throw new Error("Encrypted payload length mismatch")
+  }
+  return {
+    iterations: Number.parseInt(String(header.iterations), 10),
+    salt: base64ToBytes(header.salt),
+    iv: base64ToBytes(header.iv),
+    encrypted,
+  }
+}
+
+async function encryptBytesV2(webCrypto, passphrase, plainText) {
+  const plainBytes = new TextEncoder().encode(plainText)
+  const salt = randomBytes(webCrypto, 16)
+  const iv = randomBytes(webCrypto, 12)
+  const key = await deriveAesKey(webCrypto, passphrase, salt, PBKDF2_ITERATIONS)
+  const encrypted = new Uint8Array(await webCrypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plainBytes))
+  return packEncryptedPayloadV2({ salt, iv, iterations: PBKDF2_ITERATIONS, encrypted })
+}
+
+async function decryptBytesV2(webCrypto, passphrase, payloadBytes) {
+  const payload = unpackEncryptedPayloadV2(payloadBytes)
+  if (!Number.isFinite(payload.iterations) || payload.iterations <= 0) throw new Error("Invalid PBKDF2 iterations")
+  const key = await deriveAesKey(webCrypto, passphrase, payload.salt, payload.iterations)
+  const plain = new Uint8Array(await webCrypto.subtle.decrypt({ name: "AES-GCM", iv: payload.iv }, key, payload.encrypted))
+  return new TextDecoder().decode(plain)
+}
+
+class ProgressModal extends Modal {
+  constructor(app, t) {
+    super(app)
+    this.t = t
+  }
+
+  onOpen() {
+    const { contentEl } = this
+    contentEl.empty()
+    contentEl.createEl("h3", { text: this.t("modalTitle") })
+    this.stageEl = contentEl.createEl("p", { text: this.t("modalStarting") })
+    this.detailEl = contentEl.createEl("p", { text: "" })
+    const bar = contentEl.createDiv({ cls: "vault-sanitizer-progress-bar" })
+    bar.style.width = "100%"
+    bar.style.height = "12px"
+    bar.style.background = "var(--background-modifier-border)"
+    bar.style.borderRadius = "6px"
+    this.barInner = bar.createDiv({ cls: "vault-sanitizer-progress-fill" })
+    this.barInner.style.height = "100%"
+    this.barInner.style.width = "0%"
+    this.barInner.style.borderRadius = "6px"
+    this.barInner.style.background = "var(--interactive-accent)"
+    this.scope.register([], "Escape", () => true)
+  }
+
+  setProgress(stage, current, total, detail = "") {
+    if (this.stageEl) this.stageEl.setText(stage)
+    if (this.detailEl) this.detailEl.setText(detail || `${current}/${total}`)
+    const pct = total > 0 ? Math.max(0, Math.min(100, Math.floor((current / total) * 100))) : 0
+    if (this.barInner) this.barInner.style.width = `${pct}%`
+  }
+}
+
+class PassphraseModal extends Modal {
+  constructor(app, t) {
+    super(app)
+    this.t = t
+    this.value = ""
+    this.resolver = null
+  }
+
+  onOpen() {
+    const { contentEl } = this
+    contentEl.empty()
+    contentEl.createEl("h3", { text: this.t("passphraseTitle") })
+    const input = contentEl.createEl("input", { type: "password" })
+    input.style.width = "100%"
+    input.focus()
+    const row = contentEl.createDiv()
+    row.style.marginTop = "12px"
+    const ok = row.createEl("button", { text: this.t("passphraseOk") })
+    ok.style.marginRight = "8px"
+    const cancel = row.createEl("button", { text: this.t("passphraseCancel") })
+
+    const resolveAndClose = (val) => {
+      if (this.resolver) this.resolver(val)
+      this.close()
+    }
+    ok.onclick = () => resolveAndClose(input.value)
+    cancel.onclick = () => resolveAndClose(null)
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") resolveAndClose(input.value)
+    })
+  }
+
+  wait() {
+    return new Promise((resolve) => {
+      this.resolver = resolve
+      this.open()
+    })
+  }
+}
+
+class VaultSanitizerPlugin extends Plugin {
+  async onload() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData())
+    this.locale = resolveLocale(this.app)
+    this.webCrypto = await getWebCrypto()
+
+    this.addCommand({
+      id: "vault-sanitizer-incremental",
+      name: this.t("commandIncremental"),
+      callback: async () => this.runProcess({ mode: "incremental", dryRun: false }),
+    })
+
+    this.addSettingTab(new VaultSanitizerSettingTab(this.app, this))
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings)
+  }
+
+  t(key, vars = {}) {
+    const dict = I18N[this.locale] || I18N.en
+    const template = dict[key] || I18N.en[key] || key
+    return template.replace(/\{(\w+)\}/g, (_m, name) => String(vars[name] ?? ""))
+  }
+
+  redactContent(text, ctx) {
+    const mapRows = []
+    let ordinal = 0
+    let out = text
+
+    for (const key of ["PASSWORD_LINE", "TOKEN_LINE"]) {
+      const re = new RegExp(RISK_PATTERNS[key].source, RISK_PATTERNS[key].flags)
+      out = out.replace(re, (...args) => {
+        const match = args[0]
+        const p1 = args[1]
+        const p2 = args[2]
+        if (String(p2).startsWith("[REDACTED:")) return match
+        const offset = args[args.length - 2]
+        ordinal += 1
+        const lc = lineAndColAt(out, offset)
+        const rid = makeRid(ctx.runSalt, ctx.path, lc.line, lc.col, key, p2, ordinal)
+        mapRows.push({ rid, original: p2 })
+        return `${p1}[REDACTED:${key}:${rid}]`
+      })
+    }
+
+    for (const key of ["EMAIL", "PHONE_CN", "CN_ID", "BANK_CARD"]) {
+      const re = new RegExp(RISK_PATTERNS[key].source, RISK_PATTERNS[key].flags)
+      out = out.replace(re, (...args) => {
+        const match = args[0]
+        if (String(match).startsWith("[REDACTED:")) return match
+        const offset = args[args.length - 2]
+        ordinal += 1
+        const lc = lineAndColAt(out, offset)
+        const rid = makeRid(ctx.runSalt, ctx.path, lc.line, lc.col, key, match, ordinal)
+        mapRows.push({ rid, original: match })
+        return `[REDACTED:${key}:${rid}]`
+      })
+    }
+
+    return { text: out, mapRows }
+  }
+
+  async runProcess({ mode, dryRun }) {
+    const progress = new ProgressModal(this.app, this.t.bind(this))
+    progress.open()
+    const adapter = this.app.vault.adapter
+    const ts = nowTs()
+    const runSalt = `${ts}-${require("crypto").randomBytes(8).toString("hex")}`
+
+    try {
+      progress.setProgress(this.t("stagePreparing"), 0, 1)
+      await ensureFolder(adapter, APP_DIR)
+
+      let passphrase = null
+
+      progress.setProgress(this.t("stageLoadingState"), 0, 1)
+      let state = { files: {} }
+      if (await adapter.exists(STATE_PATH)) {
+        try {
+          const parsed = JSON.parse(await adapter.read(STATE_PATH))
+          if (parsed && parsed.files && typeof parsed.files === "object") state = parsed
+        } catch (_e) {
+          state = { files: {} }
+        }
+      }
+
+      const all = this.app.vault.getMarkdownFiles().filter((f) => !shouldSkip(f.path, this.settings.skipPrefixes || []))
+      const stateExists = Object.keys(state.files || {}).length > 0
+      const bootstrapFull = mode === "incremental" && !stateExists
+
+      const toProcess = new Set()
+      const stableStateRows = {}
+      if (mode === "full" || bootstrapFull) {
+        for (const f of all) toProcess.add(f.path)
+      } else {
+        for (let i = 0; i < all.length; i++) {
+          const f = all[i]
+          progress.setProgress(this.t("stageDiffingIncremental"), i + 1, all.length, f.path)
+          const prev = state.files[f.path]
+          if (!prev) {
+            toProcess.add(f.path)
+            continue
+          }
+          const sameMeta = Number(prev.mtime) === f.stat.mtime && Number(prev.size) === f.stat.size
+          if (sameMeta) {
+            stableStateRows[f.path] = { mtime: f.stat.mtime, size: f.stat.size, sha256: String(prev.sha256 || "") }
+            continue
+          }
+          const text = await this.app.vault.read(f)
+          const currentHash = sha256Hex(text)
+          if (String(prev.sha256 || "") === currentHash) {
+            stableStateRows[f.path] = { mtime: f.stat.mtime, size: f.stat.size, sha256: currentHash }
+          } else {
+            toProcess.add(f.path)
+          }
+        }
+      }
+
+      const processedFiles = all.filter((f) => toProcess.has(f.path))
+      const mapRows = []
+      let changedFiles = 0
+
+      for (let i = 0; i < processedFiles.length; i++) {
+        const f = processedFiles[i]
+        progress.setProgress(this.t("stageSanitizing"), i + 1, processedFiles.length, f.path)
+        const text = await this.app.vault.read(f)
+        const red = this.redactContent(text, { runSalt, path: f.path })
+        mapRows.push(...red.mapRows)
+        if (red.text !== text) {
+          changedFiles += 1
+          if (!dryRun) await this.app.vault.modify(f, red.text)
+        }
+      }
+
+      progress.setProgress(this.t("stageUpdatingMap"), 0, 1)
+      let mapRowsAdded = 0
+      if (!dryRun) {
+        let existingMapText = initMapText()
+        if (await adapter.exists(MAP_ENC_PATH)) {
+          const bin = new Uint8Array(await adapter.readBinary(MAP_ENC_PATH))
+          while (true) {
+            const modal = new PassphraseModal(this.app, (key, vars) => {
+              if (key === "passphraseTitle") return this.t("passphraseExistingTitle")
+              return this.t(key, vars)
+            })
+            passphrase = await modal.wait()
+            if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
+            try {
+              existingMapText = await decryptBytesV2(this.webCrypto, passphrase, bin)
+              break
+            } catch (_err) {
+              new Notice(this.t("noticeMapPassphraseRetry"))
+            }
+          }
+        } else if (await adapter.exists(LEGACY_MAP_PATH)) {
+          const modal = new PassphraseModal(this.app, this.t.bind(this))
+          passphrase = await modal.wait()
+          if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
+          existingMapText = await adapter.read(LEGACY_MAP_PATH)
+        } else {
+          const modal = new PassphraseModal(this.app, this.t.bind(this))
+          passphrase = await modal.wait()
+          if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
+        }
+
+        const merged = appendMapRows(existingMapText, mapRows)
+        mapRowsAdded = merged.added
+        if (mapRowsAdded > 0 || !(await adapter.exists(MAP_ENC_PATH)) || (await adapter.exists(LEGACY_MAP_PATH))) {
+          const enc = await encryptBytesV2(this.webCrypto, passphrase, merged.text)
+          await adapter.writeBinary(MAP_ENC_PATH, toExactArrayBuffer(enc))
+        }
+        if (await adapter.exists(LEGACY_MAP_PATH)) await adapter.remove(LEGACY_MAP_PATH)
+      }
+
+      progress.setProgress(this.t("stageUpdatingState"), 0, 1)
+      const finalStateFiles = {}
+      for (let i = 0; i < all.length; i++) {
+        const f = all[i]
+        if (stableStateRows[f.path]) {
+          finalStateFiles[f.path] = stableStateRows[f.path]
+          continue
+        }
+        const t = await this.app.vault.read(f)
+        const s = (toProcess.has(f.path) && !dryRun) ? await adapter.stat(f.path) : f.stat
+        finalStateFiles[f.path] = { mtime: s?.mtime ?? f.stat.mtime, size: s?.size ?? f.stat.size, sha256: sha256Hex(t) }
+      }
+      if (!dryRun) {
+        await ensureFolder(adapter, `${APP_DIR}/state`)
+        await adapter.write(STATE_PATH, `${JSON.stringify({ version: 1, last_run: ts, files: finalStateFiles }, null, 2)}\n`)
+      }
+
+      progress.setProgress(this.t("stageWritingSummary"), 1, 1)
+      let summaryText = ""
+      if (await adapter.exists(SUMMARY_PATH)) summaryText = await adapter.read(SUMMARY_PATH)
+      else summaryText = "# Sanitizer Summary\n\n"
+
+      const summary = {
+        timestamp: ts,
+        mode,
+        bootstrap_full: bootstrapFull,
+        dry_run: dryRun,
+        markdown_files: all.length,
+        processed_markdown_files: processedFiles.length,
+        changed_files: changedFiles,
+        redaction_map_rows_added: mapRowsAdded,
+        state_file: STATE_PATH,
+        sanitizer_map_file: MAP_ENC_PATH,
+      }
+      let block = `## ${ts}\n\n`
+      for (const [k, v] of Object.entries(summary)) block += `- **${k}**: \`${String(v)}\`\n`
+      block += "\n"
+      const sep = summaryText.endsWith("\n") ? "" : "\n"
+      await adapter.write(SUMMARY_PATH, `${summaryText}${sep}${block}`)
+
+      new Notice(this.t("noticeDone", { mode, processed: processedFiles.length, mapAdded: mapRowsAdded }))
+    } catch (error) {
+      new Notice(this.t("noticeFailed", { reason: error instanceof Error ? error.message : String(error) }))
+      throw error
+    } finally {
+      progress.close()
+    }
+  }
+}
+
+class VaultSanitizerSettingTab extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin)
+    this.plugin = plugin
+  }
+
+  display() {
+    const { containerEl } = this
+    containerEl.empty()
+
+    new Setting(containerEl)
+      .setName(this.plugin.t("settingOutputName"))
+      .setDesc(this.plugin.t("settingOutputDesc", { dir: APP_DIR }))
+
+    new Setting(containerEl)
+      .setName(this.plugin.t("settingDryRunName"))
+      .setDesc(this.plugin.t("settingDryRunDesc"))
+      .addButton((b) =>
+        b.setButtonText(this.plugin.t("settingRunButton")).onClick(async () => {
+          await this.plugin.runProcess({ mode: "incremental", dryRun: true })
+        })
+      )
+
+    new Setting(containerEl)
+      .setName(this.plugin.t("settingFullName"))
+      .setDesc(this.plugin.t("settingFullDesc"))
+      .addButton((b) =>
+        b.setWarning().setButtonText(this.plugin.t("settingFullButton")).onClick(async () => {
+          const ok = window.confirm(this.plugin.t("settingFullConfirm"))
+          if (!ok) return
+          await this.plugin.runProcess({ mode: "full", dryRun: false })
+        })
+      )
+  }
+}
+
+module.exports = VaultSanitizerPlugin

@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-vault-sanitizer",
+  "name": "Vault Sanitizer",
+  "version": "1.0.0",
+  "minAppVersion": "1.5.0",
+  "description": "Incremental anonymization with encrypted sanitizer map and run summaries.",
+  "author": "openabe",
+  "isDesktopOnly": false
+}

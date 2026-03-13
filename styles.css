@@ -1,0 +1,7 @@
+.vault-sanitizer-progress-bar {
+  margin-top: 8px;
+}
+
+.vault-sanitizer-progress-fill {
+  transition: width 120ms ease;
+}
