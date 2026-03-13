@@ -41,12 +41,15 @@ const I18N = {
     stageUpdatingState: "Updating state",
     stageWritingSummary: "Writing summary",
     passphraseTitle: "Enter sanitizer map passphrase",
+    passphraseNewTitle: "Set sanitizer map passphrase",
+    passphraseConfirmTitle: "Confirm sanitizer map passphrase",
     passphraseExistingTitle: "Existing sanitizer map detected, enter passphrase",
     passphraseOk: "OK",
     passphraseCancel: "Cancel",
     noticeDone: "Vault Sanitizer done: mode={mode}, processed={processed}, map_added={mapAdded}",
     noticeFailed: "Vault Sanitizer failed: {reason}",
     noticeMapPassphraseRetry: "Passphrase does not match existing map. Please re-enter.",
+    noticeMapPassphraseMismatch: "Passphrases do not match. Please try again.",
     settingOutputName: "Output directory",
     settingOutputDesc: "All outputs are written under {dir}/",
     settingDryRunName: "Run dry run",
@@ -70,12 +73,15 @@ const I18N = {
     stageUpdatingState: "更新状态文件",
     stageWritingSummary: "写入汇总",
     passphraseTitle: "输入映射表密码",
+    passphraseNewTitle: "设置映射表密码",
+    passphraseConfirmTitle: "确认映射表密码",
     passphraseExistingTitle: "检测到已有映射表，请输入密码",
     passphraseOk: "确认",
     passphraseCancel: "取消",
     noticeDone: "Vault Sanitizer 完成：模式={mode}，处理={processed}，新增映射={mapAdded}",
     noticeFailed: "Vault Sanitizer 失败：{reason}",
     noticeMapPassphraseRetry: "密码与已有映射表不一致，请重新输入。",
+    noticeMapPassphraseMismatch: "两次输入的密码不一致，请重试。",
     settingOutputName: "输出目录",
     settingOutputDesc: "所有输出写入 {dir}/",
     settingDryRunName: "运行 dry run",
@@ -335,9 +341,10 @@ class ProgressModal extends Modal {
 }
 
 class PassphraseModal extends Modal {
-  constructor(app, t) {
+  constructor(app, t, options = {}) {
     super(app)
     this.t = t
+    this.options = options
     this.value = ""
     this.resolver = null
   }
@@ -345,9 +352,16 @@ class PassphraseModal extends Modal {
   onOpen() {
     const { contentEl } = this
     contentEl.empty()
-    contentEl.createEl("h3", { text: this.t("passphraseTitle") })
+    const titleKey = this.options.titleKey || "passphraseTitle"
+    contentEl.createEl("h3", { text: this.t(titleKey) })
     const input = contentEl.createEl("input", { type: "password" })
     input.style.width = "100%"
+    let confirmInput = null
+    if (this.options.confirm) {
+      contentEl.createEl("p", { text: this.t("passphraseConfirmTitle") })
+      confirmInput = contentEl.createEl("input", { type: "password" })
+      confirmInput.style.width = "100%"
+    }
     input.focus()
     const row = contentEl.createDiv()
     row.style.marginTop = "12px"
@@ -359,11 +373,22 @@ class PassphraseModal extends Modal {
       if (this.resolver) this.resolver(val)
       this.close()
     }
-    ok.onclick = () => resolveAndClose(input.value)
+    ok.onclick = () => {
+      if (confirmInput && input.value !== confirmInput.value) {
+        new Notice(this.t("noticeMapPassphraseMismatch"))
+        return
+      }
+      resolveAndClose(input.value)
+    }
     cancel.onclick = () => resolveAndClose(null)
     input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") resolveAndClose(input.value)
+      if (e.key === "Enter") ok.click()
     })
+    if (confirmInput) {
+      confirmInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") ok.click()
+      })
+    }
   }
 
   wait() {
@@ -437,6 +462,39 @@ class VaultSanitizerPlugin extends Plugin {
     return { text: out, mapRows }
   }
 
+  async prepareMapContext(adapter) {
+    let passphrase = null
+    let existingMapText = initMapText()
+    const hasEncryptedMap = await adapter.exists(MAP_ENC_PATH)
+    const hasLegacyMap = await adapter.exists(LEGACY_MAP_PATH)
+
+    if (hasEncryptedMap) {
+      const bin = new Uint8Array(await adapter.readBinary(MAP_ENC_PATH))
+      while (true) {
+        const modal = new PassphraseModal(this.app, this.t.bind(this), { titleKey: "passphraseExistingTitle" })
+        passphrase = await modal.wait()
+        if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
+        try {
+          existingMapText = await decryptBytesV2(this.webCrypto, passphrase, bin)
+          break
+        } catch (_err) {
+          new Notice(this.t("noticeMapPassphraseRetry"))
+        }
+      }
+    } else if (hasLegacyMap) {
+      const modal = new PassphraseModal(this.app, this.t.bind(this), { titleKey: "passphraseNewTitle", confirm: true })
+      passphrase = await modal.wait()
+      if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
+      existingMapText = await adapter.read(LEGACY_MAP_PATH)
+    } else {
+      const modal = new PassphraseModal(this.app, this.t.bind(this), { titleKey: "passphraseNewTitle", confirm: true })
+      passphrase = await modal.wait()
+      if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
+    }
+
+    return { passphrase, existingMapText, hasEncryptedMap, hasLegacyMap }
+  }
+
   async runProcess({ mode, dryRun }) {
     const progress = new ProgressModal(this.app, this.t.bind(this))
     progress.open()
@@ -448,7 +506,7 @@ class VaultSanitizerPlugin extends Plugin {
       progress.setProgress(this.t("stagePreparing"), 0, 1)
       await ensureFolder(adapter, APP_DIR)
 
-      let passphrase = null
+      let mapContext = null
 
       progress.setProgress(this.t("stageLoadingState"), 0, 1)
       let state = { files: {} }
@@ -464,6 +522,11 @@ class VaultSanitizerPlugin extends Plugin {
       const all = this.app.vault.getMarkdownFiles().filter((f) => !shouldSkip(f.path, this.settings.skipPrefixes || []))
       const stateExists = Object.keys(state.files || {}).length > 0
       const bootstrapFull = mode === "incremental" && !stateExists
+
+      if (!dryRun) {
+        progress.setProgress(this.t("stageUpdatingMap"), 0, 1)
+        mapContext = await this.prepareMapContext(adapter)
+      }
 
       const toProcess = new Set()
       const stableStateRows = {}
@@ -512,41 +575,13 @@ class VaultSanitizerPlugin extends Plugin {
       progress.setProgress(this.t("stageUpdatingMap"), 0, 1)
       let mapRowsAdded = 0
       if (!dryRun) {
-        let existingMapText = initMapText()
-        if (await adapter.exists(MAP_ENC_PATH)) {
-          const bin = new Uint8Array(await adapter.readBinary(MAP_ENC_PATH))
-          while (true) {
-            const modal = new PassphraseModal(this.app, (key, vars) => {
-              if (key === "passphraseTitle") return this.t("passphraseExistingTitle")
-              return this.t(key, vars)
-            })
-            passphrase = await modal.wait()
-            if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
-            try {
-              existingMapText = await decryptBytesV2(this.webCrypto, passphrase, bin)
-              break
-            } catch (_err) {
-              new Notice(this.t("noticeMapPassphraseRetry"))
-            }
-          }
-        } else if (await adapter.exists(LEGACY_MAP_PATH)) {
-          const modal = new PassphraseModal(this.app, this.t.bind(this))
-          passphrase = await modal.wait()
-          if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
-          existingMapText = await adapter.read(LEGACY_MAP_PATH)
-        } else {
-          const modal = new PassphraseModal(this.app, this.t.bind(this))
-          passphrase = await modal.wait()
-          if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
-        }
-
-        const merged = appendMapRows(existingMapText, mapRows)
+        const merged = appendMapRows(mapContext.existingMapText, mapRows)
         mapRowsAdded = merged.added
-        if (mapRowsAdded > 0 || !(await adapter.exists(MAP_ENC_PATH)) || (await adapter.exists(LEGACY_MAP_PATH))) {
-          const enc = await encryptBytesV2(this.webCrypto, passphrase, merged.text)
+        if (mapRowsAdded > 0 || !mapContext.hasEncryptedMap || mapContext.hasLegacyMap) {
+          const enc = await encryptBytesV2(this.webCrypto, mapContext.passphrase, merged.text)
           await adapter.writeBinary(MAP_ENC_PATH, toExactArrayBuffer(enc))
         }
-        if (await adapter.exists(LEGACY_MAP_PATH)) await adapter.remove(LEGACY_MAP_PATH)
+        if (mapContext.hasLegacyMap && (await adapter.exists(LEGACY_MAP_PATH))) await adapter.remove(LEGACY_MAP_PATH)
       }
 
       progress.setProgress(this.t("stageUpdatingState"), 0, 1)
@@ -562,7 +597,6 @@ class VaultSanitizerPlugin extends Plugin {
         finalStateFiles[f.path] = { mtime: s?.mtime ?? f.stat.mtime, size: s?.size ?? f.stat.size, sha256: sha256Hex(t) }
       }
       if (!dryRun) {
-        await ensureFolder(adapter, `${APP_DIR}/state`)
         await adapter.write(STATE_PATH, `${JSON.stringify({ version: 1, last_run: ts, files: finalStateFiles }, null, 2)}\n`)
       }
 
