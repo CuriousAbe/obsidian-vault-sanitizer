@@ -100,9 +100,52 @@ const RISK_PATTERNS = {
   PHONE_CN: /(?<!\d)1[3-9]\d{9}(?!\d)/g,
   CN_ID: /(?<!\d)(\d{17}[\dXx]|\d{15})(?!\d)/g,
   BANK_CARD: /(?<!\d)\d{16,19}(?!\d)/g,
-  PASSWORD_LINE: /^(\s*(?:password|passwd|pwd|密码)\s*[:：]\s*)(\S+)\s*$/gim,
-  TOKEN_LINE: /^(\s*(?:token|api[_-]?key|secret)\s*[:：]\s*)(\S+)\s*$/gim,
+  LONG_DIGITS: /(?<!\d)\d{10,15}(?!\d)/g,
 }
+
+const SENSITIVE_LABEL_PATTERNS = [
+  "password",
+  "passwd",
+  "pwd",
+  "登录密码",
+  "登入密码",
+  "交易密码",
+  "邮箱密码",
+  "店铺密码",
+  "密码",
+  "token",
+  "api[_\\s-]?key",
+  "secret",
+  "密钥(?:\\s*v\\d+)?",
+  "key",
+  "账号",
+  "账户",
+  "用户名称",
+  "用户名",
+  "orgid",
+  "account\\s*name",
+  "account\\s*number",
+  "account",
+  "swift(?:\\s*code)?",
+  "local\\s*bank\\s*code",
+  "work\\s*phone(?:\\s*\\[\\])?",
+  "证书序列号",
+  "紧急备份代码",
+  "绑定手机号码",
+  "香港有效卡",
+  "香港卡",
+  "美国卡",
+  "收款行名",
+  "收款账户号码",
+  "收款人名字",
+  "收款人地址",
+  "银行地址",
+]
+
+const SENSITIVE_LABEL_VALUE = new RegExp(
+  `(^|[\\s,;，；])(${SENSITIVE_LABEL_PATTERNS.join("|")})(\\s*(?:[:：=]|\\s)\\s*|\\s*)([^\\s,;，；]{4,})`,
+  "gim"
+)
 
 function nowTs() {
   const d = new Date()
@@ -429,23 +472,24 @@ class VaultSanitizerPlugin extends Plugin {
     let ordinal = 0
     let out = text
 
-    for (const key of ["PASSWORD_LINE", "TOKEN_LINE"]) {
-      const re = new RegExp(RISK_PATTERNS[key].source, RISK_PATTERNS[key].flags)
-      out = out.replace(re, (...args) => {
-        const match = args[0]
-        const p1 = args[1]
-        const p2 = args[2]
-        if (String(p2).startsWith("[REDACTED:")) return match
-        const offset = args[args.length - 2]
-        ordinal += 1
-        const lc = lineAndColAt(out, offset)
-        const rid = makeRid(ctx.runSalt, ctx.path, lc.line, lc.col, key, p2, ordinal)
-        mapRows.push({ rid, original: p2 })
-        return `${p1}[REDACTED:${key}:${rid}]`
-      })
-    }
+    const pairRe = new RegExp(SENSITIVE_LABEL_VALUE.source, SENSITIVE_LABEL_VALUE.flags)
+    out = out.replace(pairRe, (...args) => {
+      const match = args[0]
+      const prefix = args[1]
+      const label = args[2]
+      const sep = args[3]
+      const value = args[4]
+      if (String(value).startsWith("[REDACTED:")) return match
+      const offset = args[args.length - 2]
+      const valueOffset = offset + String(prefix).length + String(label).length + String(sep).length
+      ordinal += 1
+      const lc = lineAndColAt(out, valueOffset)
+      const rid = makeRid(ctx.runSalt, ctx.path, lc.line, lc.col, "LABEL", value, ordinal)
+      mapRows.push({ rid, original: value })
+      return `${prefix}${label}${sep}[REDACTED:LABEL:${rid}]`
+    })
 
-    for (const key of ["EMAIL", "PHONE_CN", "CN_ID", "BANK_CARD"]) {
+    for (const key of ["EMAIL", "PHONE_CN", "CN_ID", "BANK_CARD", "LONG_DIGITS"]) {
       const re = new RegExp(RISK_PATTERNS[key].source, RISK_PATTERNS[key].flags)
       out = out.replace(re, (...args) => {
         const match = args[0]
