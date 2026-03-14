@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.5
+
+- Add "Sanitize current file" command to redact sensitive content in the active file only, with per-match review and map update.
+- Add "Restore current file" command to recover redacted placeholders in the active file from the sanitizer map.
+- Replace single-modal dual-input passphrase confirmation with two sequential modals when setting a new map passphrase.
+
 ## 1.1.4
 
 - Add per-match review during incremental update: confirm redact/skip for each hit with highlighted one-line preview.

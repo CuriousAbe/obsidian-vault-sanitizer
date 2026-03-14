@@ -74,12 +74,20 @@ const I18N = {
     settingRestoreDesc: "Recover redacted content from sanitizer map.",
     settingRestoreButton: "Run Restore",
     settingRestoreConfirm: "Run restore now? This will overwrite redacted placeholders.",
+    commandSanitizeCurrent: "Sanitize current file",
+    commandRestoreCurrent: "Restore current file",
+    noticeSanitizeCurrentDone: "Sanitizer done: map_added={mapAdded}",
+    noticeRestoreCurrentDone: "Restore done: tokens={tokens}",
     errorPassphraseRequired: "Passphrase is required",
     errorMapNotFound: "Sanitizer map not found",
   },
   zh: {
     commandIncremental: "Incremental update",
     commandRestore: "Restore from sanitizer map",
+    commandSanitizeCurrent: "Sanitize current file",
+    commandRestoreCurrent: "Restore current file",
+    noticeSanitizeCurrentDone: "脱敏完成：新增映射={mapAdded}",
+    noticeRestoreCurrentDone: "恢复完成：替换={tokens}",
     modalTitle: "Vault Sanitizer",
     modalStarting: "开始执行...",
     stagePreparing: "准备中",
@@ -623,12 +631,6 @@ class PassphraseModal extends Modal {
     contentEl.createEl("h3", { text: this.t(titleKey) })
     const input = contentEl.createEl("input", { type: "password" })
     input.style.width = "100%"
-    let confirmInput = null
-    if (this.options.confirm) {
-      contentEl.createEl("p", { text: this.t("passphraseConfirmTitle") })
-      confirmInput = contentEl.createEl("input", { type: "password" })
-      confirmInput.style.width = "100%"
-    }
     input.focus()
     const row = contentEl.createDiv()
     row.style.marginTop = "12px"
@@ -640,22 +642,11 @@ class PassphraseModal extends Modal {
       if (this.resolver) this.resolver(val)
       this.close()
     }
-    ok.onclick = () => {
-      if (confirmInput && input.value !== confirmInput.value) {
-        new Notice(this.t("noticeMapPassphraseMismatch"))
-        return
-      }
-      resolveAndClose(input.value)
-    }
+    ok.onclick = () => resolveAndClose(input.value)
     cancel.onclick = () => resolveAndClose(null)
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter") ok.click()
     })
-    if (confirmInput) {
-      confirmInput.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") ok.click()
-      })
-    }
   }
 
   wait() {
@@ -740,6 +731,24 @@ class VaultSanitizerPlugin extends Plugin {
       callback: async () => this.runRestoreProcess(),
     })
 
+    this.addCommand({
+      id: "vault-sanitizer-sanitize-current",
+      name: this.t("commandSanitizeCurrent"),
+      editorCallback: async (_editor, view) => {
+        if (!view.file) return
+        await this.runSanitizeCurrentFile(view.file)
+      },
+    })
+
+    this.addCommand({
+      id: "vault-sanitizer-restore-current",
+      name: this.t("commandRestoreCurrent"),
+      editorCallback: async (_editor, view) => {
+        if (!view.file) return
+        await this.runRestoreCurrentFile(view.file)
+      },
+    })
+
     this.addSettingTab(new VaultSanitizerSettingTab(this.app, this))
   }
 
@@ -814,14 +823,28 @@ class VaultSanitizerPlugin extends Plugin {
         }
       }
     } else if (hasLegacyMap) {
-      const modal = new PassphraseModal(this.app, this.t.bind(this), { titleKey: "passphraseNewTitle", confirm: true })
-      passphrase = await modal.wait()
-      if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
+      while (true) {
+        const m1 = new PassphraseModal(this.app, this.t.bind(this), { titleKey: "passphraseNewTitle" })
+        passphrase = await m1.wait()
+        if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
+        const m2 = new PassphraseModal(this.app, this.t.bind(this), { titleKey: "passphraseConfirmTitle" })
+        const passphrase2 = await m2.wait()
+        if (!passphrase2) throw new Error(this.t("errorPassphraseRequired"))
+        if (passphrase === passphrase2) break
+        new Notice(this.t("noticeMapPassphraseMismatch"))
+      }
       existingMapText = await adapter.read(LEGACY_MAP_PATH)
     } else {
-      const modal = new PassphraseModal(this.app, this.t.bind(this), { titleKey: "passphraseNewTitle", confirm: true })
-      passphrase = await modal.wait()
-      if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
+      while (true) {
+        const m1 = new PassphraseModal(this.app, this.t.bind(this), { titleKey: "passphraseNewTitle" })
+        passphrase = await m1.wait()
+        if (!passphrase) throw new Error(this.t("errorPassphraseRequired"))
+        const m2 = new PassphraseModal(this.app, this.t.bind(this), { titleKey: "passphraseConfirmTitle" })
+        const passphrase2 = await m2.wait()
+        if (!passphrase2) throw new Error(this.t("errorPassphraseRequired"))
+        if (passphrase === passphrase2) break
+        new Notice(this.t("noticeMapPassphraseMismatch"))
+      }
     }
 
     return { passphrase, existingMapText, hasEncryptedMap, hasLegacyMap }
@@ -876,6 +899,94 @@ class VaultSanitizerPlugin extends Plugin {
       }
 
       new Notice(this.t("noticeRestoreDone", { files: restoredFiles, tokens: restoredTokens }))
+    } catch (error) {
+      new Notice(this.t("noticeFailed", { reason: error instanceof Error ? error.message : String(error) }))
+      throw error
+    } finally {
+      progress.close()
+    }
+  }
+
+  async runSanitizeCurrentFile(file) {
+    const progress = new ProgressModal(this.app, this.t.bind(this))
+    progress.open()
+    const adapter = this.app.vault.adapter
+    const ts = nowTs()
+    const runSalt = `${ts}-${require("crypto").randomBytes(8).toString("hex")}`
+
+    try {
+      progress.setProgress(this.t("stagePreparing"), 0, 1)
+      await ensureFolder(adapter, APP_DIR)
+
+      progress.setProgress(this.t("stageUpdatingMap"), 0, 1)
+      const mapContext = await this.prepareMapContext(adapter)
+
+      progress.setProgress(this.t("stageSanitizing"), 0, 1)
+      const text = await this.app.vault.read(file)
+      const reviewState = { mode: "ask" }
+      const red = await this.reviewAndRedactContent(text, { runSalt, path: file.path }, reviewState)
+
+      let mapRowsAdded = 0
+      if (red.mapRows.length > 0) {
+        await this.app.vault.modify(file, red.text)
+        progress.setProgress(this.t("stageUpdatingMap"), 0, 1)
+        const merged = appendMapRows(mapContext.existingMapText, red.mapRows)
+        mapRowsAdded = merged.added
+        if (mapRowsAdded > 0 || !mapContext.hasEncryptedMap || mapContext.hasLegacyMap) {
+          const enc = await encryptBytesV2(this.webCrypto, mapContext.passphrase, merged.text)
+          await adapter.writeBinary(MAP_ENC_PATH, toExactArrayBuffer(enc))
+        }
+        if (mapContext.hasLegacyMap && (await adapter.exists(LEGACY_MAP_PATH))) {
+          await adapter.remove(LEGACY_MAP_PATH)
+        }
+      }
+
+      progress.setProgress(this.t("stageUpdatingState"), 0, 1)
+      let state = { files: {} }
+      if (await adapter.exists(STATE_PATH)) {
+        try {
+          const parsed = JSON.parse(await adapter.read(STATE_PATH))
+          if (parsed && parsed.files && typeof parsed.files === "object") state = parsed
+        } catch (_e) {
+          state = { files: {} }
+        }
+      }
+      const newText = red.mapRows.length > 0 ? red.text : text
+      const fileStat = await adapter.stat(file.path)
+      state.files[file.path] = {
+        mtime: fileStat?.mtime ?? file.stat.mtime,
+        size: fileStat?.size ?? file.stat.size,
+        sha256: sha256Hex(newText),
+      }
+      await adapter.write(STATE_PATH, `${JSON.stringify({ version: 1, last_run: ts, files: state.files }, null, 2)}\n`)
+
+      new Notice(this.t("noticeSanitizeCurrentDone", { mapAdded: mapRowsAdded }))
+    } catch (error) {
+      new Notice(this.t("noticeFailed", { reason: error instanceof Error ? error.message : String(error) }))
+      throw error
+    } finally {
+      progress.close()
+    }
+  }
+
+  async runRestoreCurrentFile(file) {
+    const progress = new ProgressModal(this.app, this.t.bind(this))
+    progress.open()
+
+    try {
+      progress.setProgress(this.t("stageLoadingMap"), 0, 1)
+      const mapText = await this.loadMapTextForRestore(this.app.vault.adapter)
+      const ridToOriginal = parseMapRidLookup(mapText)
+
+      progress.setProgress(this.t("stageRestoring"), 0, 1)
+      const text = await this.app.vault.read(file)
+      const restored = restoreContent(text, ridToOriginal)
+
+      if (restored.replaced > 0) {
+        await this.app.vault.modify(file, restored.text)
+      }
+
+      new Notice(this.t("noticeRestoreCurrentDone", { tokens: restored.replaced }))
     } catch (error) {
       new Notice(this.t("noticeFailed", { reason: error instanceof Error ? error.message : String(error) }))
       throw error
